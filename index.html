@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mô Phỏng Kho Hàng 3D - Bin Level (API)</title>
+
+  <!-- Tailwind (CDN) + font Inter -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+
+  <style>
+    body { font-family: 'Inter', sans-serif; margin:0; overflow:hidden; background:#2d3748; }
+    #info-panel { transition: transform .3s ease-in-out; }
+    .info-hidden { transform: translateX(100%); }
+    #loading-overlay {
+      position: absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      background: rgba(0,0,0,.6); color:#fff; font-size:1.1rem; z-index:100;
+    }
+  </style>
+
+  <!-- Import map cho three.js -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body class="text-white">
+
+  <div id="loading-overlay"><p>Đang tải mô hình + dữ liệu...</p></div>
+  <div id="container"></div>
+
+  <!-- Panel thông tin -->
+  <div id="info-panel" class="info-hidden fixed top-0 right-0 h-full w-full sm:w-1/3 lg:w-1/4 bg-white/10 backdrop-blur-md p-6 shadow-2xl z-20 text-white border-l border-white/20 overflow-y-auto">
+    <button id="close-panel-btn" class="absolute top-4 right-4 text-white hover:text-gray-300" aria-label="Đóng">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+      </svg>
+    </button>
+    <h2 class="text-2xl font-bold mb-6" id="info-title">Thông tin Ô Kệ</h2>
+    <div id="info-content" class="space-y-4">
+      <p><strong>ID Ô Kệ:</strong> <span id="cell-id"></span></p>
+      <p><strong>Sức chứa tối đa:</strong> <span id="cell-capacity"></span></p>
+      <div id="pallets-container" class="mt-4 space-y-3"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ===== 1) API URL =====
+    const API_URL = "https://script.google.com/macros/s/AKfycbz9B5iBwce-8FPWO2yLfYVt_gHezAf7JTv1kAMxa2Gq7xLcaoGMal1E-do_DgqCu_9Dww/exec";
+    const getJSON = async (path) => {
+      const res = await fetch(`${API_URL}${path}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      return res.json();
+    };
+
+    // ===== 2) Biến/DOM =====
+    let scene, camera, renderer, controls, raycaster, pointer;
+    let INTERSECTED;
+    const warehouseObjects = new THREE.Group();
+
+    const container = document.getElementById('container');
+    const infoPanel = document.getElementById('info-panel');
+    const closePanelBtn = document.getElementById('close-panel-btn');
+    const infoTitle = document.getElementById('info-title');
+    const cellIdSpan = document.getElementById('cell-id');
+    const cellCapacitySpan = document.getElementById('cell-capacity');
+    const palletsContainer = document.getElementById('pallets-container');
+    const loadingOverlay = document.getElementById('loading-overlay');
+
+    // ===== 3) Scene cơ bản =====
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x2d3748);
+      scene.fog = new THREE.Fog(0x2d3748, 50, 200);
+
+      camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.1, 1000);
+      camera.position.set(0, 40, 85);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.minDistance = 20;
+      controls.maxDistance = 150;
+      controls.maxPolarAngle = Math.PI/2.1;
+
+      const amb = new THREE.AmbientLight(0xffffff, 0.7);
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(-30, 50, 30);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(2048, 2048);
+      scene.add(amb, dir);
+
+      raycaster = new THREE.Raycaster();
+      pointer = new THREE.Vector2();
+
+      createFloor();
+      createShelves();
+      scene.add(warehouseObjects);
+
+      addEventListener('resize', onWindowResize);
+      document.addEventListener('pointermove', onPointerMove);
+      document.addEventListener('click', onDocumentClick);
+      closePanelBtn.addEventListener('click', () => infoPanel.classList.add('info-hidden'));
+
+      animate();
+
+      // nạp dữ liệu
+      refreshHeatmap().finally(() => loadingOverlay.style.display = 'none');
+      setInterval(refreshHeatmap, 120000); // 2 phút refresh
+    }
+
+    function createFloor() {
+      const g = new THREE.PlaneGeometry(200, 200);
+      const m = new THREE.MeshStandardMaterial({ color: 0x4a5568, metalness: 0.1, roughness: 0.8 });
+      const mesh = new THREE.Mesh(g, m);
+      mesh.rotation.x = -Math.PI/2;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+    }
+
+    // ===== 4) Dựng kệ + overlay heatmap =====
+    function createShelvingUnit(name, position, cellsX, cellsY, isDoubleSided, color = 0x3b82f6) {
+      const shelfGroup = new THREE.Group();
+      shelfGroup.name = name;
+
+      const frameThickness = 0.2;
+      const shelfThickness = 0.1;
+      const cellWidth = 5, cellHeight = 4, cellDepth = 6;
+
+      const unitWidth = cellsX * cellWidth;
+      const unitHeight = cellsY * cellHeight;
+
+      // khung dọc
+      for (let i = 0; i <= cellsX; i++) {
+        const kValues = isDoubleSided ? [0, 1, 2] : [0, 1];
+        kValues.forEach((_, idx) => {
+          const zPos = isDoubleSided ? (idx * cellDepth) - cellDepth
+                                     : (idx * (cellDepth - frameThickness)) - cellDepth/2 + frameThickness/2;
+          const barGeo = new THREE.BoxGeometry(frameThickness, unitHeight, frameThickness);
+          const barMat = new THREE.MeshStandardMaterial({ color, metalness: 0.5, roughness: 0.5 });
+          const bar = new THREE.Mesh(barGeo, barMat);
+          bar.position.set(i * cellWidth - unitWidth/2, unitHeight/2, zPos);
+          bar.castShadow = true;
+          shelfGroup.add(bar);
+        });
+      }
+
+      // khung ngang
+      for (let j = 0; j <= cellsY; j++) {
+        const kValues = isDoubleSided ? [0, 1, 2] : [0, 1];
+        kValues.forEach((_, idx) => {
+          const zPos = isDoubleSided ? (idx * cellDepth) - cellDepth
+                                     : (idx * (cellDepth - frameThickness)) - cellDepth/2 + frameThickness/2;
+          const barGeo = new THREE.BoxGeometry(unitWidth, frameThickness, frameThickness);
+          const barMat = new THREE.MeshStandardMaterial({ color: 0xf97316, metalness: 0.4, roughness: 0.6 });
+          const bar = new THREE.Mesh(barGeo, barMat);
+          bar.position.set(0, j * cellHeight, zPos);
+          bar.castShadow = true;
+          shelfGroup.add(bar);
+        });
+      }
+
+      const sides = isDoubleSided ? 2 : 1;
+      for (let side = 0; side < sides; side++) {
+        for (let i = 0; i < cellsX; i++) {
+          for (let j = 0; j < cellsY; j++) {
+            const sideId = isDoubleSided ? (side === 0 ? '-F' : '-B') : '';
+            const zOffset = isDoubleSided ? (side === 0 ? -cellDepth/2 : cellDepth/2) : 0;
+
+            // sàn
+            const shelfGeo = new THREE.BoxGeometry(cellWidth - frameThickness, shelfThickness, cellDepth);
+            const shelfMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.2, roughness: 0.8 });
+            const shelf = new THREE.Mesh(shelfGeo, shelfMat);
+            shelf.position.set(i*cellWidth - unitWidth/2 + cellWidth/2, j*cellHeight + shelfThickness/2, zOffset);
+            shelf.receiveShadow = true;
+            shelfGroup.add(shelf);
+
+            // ô tương tác
+            const cellId = `${name}-${i+1}-${j+1}${sideId}`;
+            const interGeo = new THREE.BoxGeometry(cellWidth, cellHeight, cellDepth);
+            const interMat = new THREE.MeshBasicMaterial({ color: 0xff0000, visible: false, transparent: true, opacity: 0.3 });
+            const inter = new THREE.Mesh(interGeo, interMat);
+            inter.name = cellId;
+            inter.position.set(i*cellWidth - unitWidth/2 + cellWidth/2, j*cellHeight + cellHeight/2, zOffset);
+            inter.userData.type = 'cell';
+            inter.userData.isDoubleSided = isDoubleSided;
+            shelfGroup.add(inter);
+
+            // overlay heatmap
+            const heatGeo = new THREE.BoxGeometry(cellWidth - 0.2, cellHeight - 0.2, cellDepth - 0.2);
+            const heatMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.25, depthWrite: false });
+            const heat = new THREE.Mesh(heatGeo, heatMat);
+            heat.name = `heat-${cellId}`;
+            heat.position.copy(inter.position);
+            heat.visible = false;
+            shelfGroup.add(heat);
+          }
+        }
+      }
+
+      shelfGroup.position.set(position.x, 0, position.y);
+      warehouseObjects.add(shelfGroup);
+    }
+
+    function createShelves() {
+      // Kệ A: 12 ô, 3 tầng, một mặt
+      createShelvingUnit('A', { x: 0, y: -45 }, 12, 3, false);
+
+      // Kệ B: hai mặt
+      const largeX = -20;
+      createShelvingUnit('B1', { x: largeX, y: -15 }, 7, 3, true);
+      createShelvingUnit('B2', { x: largeX, y: 15 }, 7, 3, true);
+      createShelvingUnit('B3', { x: largeX, y: 45 }, 7, 3, true);
+
+      const smallX = 15.75;
+      createShelvingUnit('B1.2', { x: smallX, y: -15 }, 3, 3, true);
+      createShelvingUnit('B2.2', { x: smallX, y: 15 }, 3, 3, true);
+      createShelvingUnit('B3.2', { x: smallX, y: 45 }, 3, 3, true);
+    }
+
+    // ===== 5) API -> Heatmap (fallback qty_book) =====
+    async function refreshHeatmap() {
+      try {
+        const toNum = (x) => {
+          const n = Number(x);
+          return Number.isFinite(n) ? n : null;
+        };
+
+        const rows = await getJSON("?action=inventory");
+        rows.forEach(r => {
+          const heat = warehouseObjects.getObjectByName(`heat-${r.bin_id}`, true);
+          if (!heat) return; // bin_id trên sheet phải trùng tên ô
+
+          const cap = toNum(r.capacity) || 1;
+          const qv  = toNum(r.qty_vision);
+          const qb  = toNum(r.qty_book);
+          // nếu qty_vision hợp lệ thì dùng, nếu trống/NaN thì fallback qty_book
+          const qty = (qv === null ? (qb || 0) : (qv || (qb || 0)));
+          const fill = qty / cap;
+
+          const color = fill < 0.3 ? 0xff4d4f  // đỏ
+                      : fill < 0.6 ? 0xffd666  // vàng
+                                  : 0x52c41a; // xanh
+          heat.material.color.setHex(color);
+          heat.visible = true;
+        });
+      } catch (e) {
+        console.error("refreshHeatmap failed:", e);
+      }
+    }
+
+    // ===== 6) Panel bin detail (có nút nhập/xuất) =====
+    async function updateInfoPanel(id, isDoubleSided) {
+      cellIdSpan.textContent = id;
+      cellCapacitySpan.textContent = isDoubleSided ? '2 Pallet (cho cả ô)' : '2 Pallet';
+      infoTitle.textContent = `Thông tin Vị trí ${id}`;
+      palletsContainer.innerHTML = '<p class="text-gray-400">Đang tải dữ liệu...</p>';
+
+      try {
+        const bin = await getJSON(`?action=bin&bin_id=${encodeURIComponent(id)}`);
+        if (bin.error) {
+          palletsContainer.innerHTML = `<p class="text-rose-300">${bin.error}</p>`;
+          return;
+        }
+        const cap = Number(bin.capacity) || 0;
+        const book = Number(bin.qty_book) || 0;
+        const vis  = (bin.qty_vision ?? null);
+
+        palletsContainer.innerHTML = `
+          <div class="bg-black/20 p-4 rounded-lg border border-white/10 space-y-2">
+            <p><strong>SKU:</strong> ${bin.sku || '-'}</p>
+            <p><strong>Sức chứa:</strong> ${cap} thùng</p>
+            <p><strong>Tồn sổ sách (qty_book):</strong> <span id="bookNow">${book}</span></p>
+            <p><strong>Tồn AI (qty_vision):</strong> ${vis === null ? '—' : vis}</p>
+            ${bin.last_image_url ? `<img src="${bin.last_image_url}" class="mt-2 rounded border border-white/10">` : ''}
+
+            <div class="mt-3 text-sm">
+              <label class="block text-white/80 mb-1">Điều chỉnh nhanh</label>
+              <div class="flex items-center gap-2">
+                <input id="adjQty" type="number" value="5" min="1"
+                       class="w-20 px-2 py-1 rounded bg-white/10 border border-white/20">
+                <button id="btnIn"  class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500">+ Nhập</button>
+                <button id="btnOut" class="px-3 py-1 rounded bg-rose-600 hover:bg-rose-500">– Xuất</button>
+              </div>
+              <p id="adjMsg" class="text-xs text-white/70 mt-1"></p>
+            </div>
+
+            <p class="text-xs text-white/60">Cập nhật: ${bin.last_update || '-'}</p>
+          </div>
+
+          <div class="fixed bottom-4 left-4 text-xs bg-white/10 backdrop-blur-md px-3 py-2 rounded">
+            <div><span style="display:inline-block;width:10px;height:10px;background:#ff4d4f;margin-right:6px;"></span> &lt;30% (thấp)</div>
+            <div><span style="display:inline-block;width:10px;height:10px;background:#ffd666;margin-right:6px;"></span> 30–60%</div>
+            <div><span style="display:inline-block;width:10px;height:10px;background:#52c41a;margin-right:6px;"></span> &gt;60% (đủ)</div>
+          </div>
+        `;
+
+        document.getElementById('btnIn').onclick  = () => adjustBin(id, +1);
+        document.getElementById('btnOut').onclick = () => adjustBin(id, -1);
+
+      } catch (e) {
+        palletsContainer.innerHTML = `<p class="text-rose-300">Lỗi tải API: ${e.message}</p>`;
+      }
+    }
+
+    // ===== 7) Events/Render =====
+    function onWindowResize() {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    }
+    function onPointerMove(e) {
+      pointer.x = (e.clientX/innerWidth)*2 - 1;
+      pointer.y = -(e.clientY/innerHeight)*2 + 1;
+    }
+    function onDocumentClick(e) {
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(warehouseObjects.children, true);
+      const cellHit = hits.find(h => h.object.userData.type === 'cell');
+      if (cellHit) {
+        const obj = cellHit.object;
+        updateInfoPanel(obj.name, obj.userData.isDoubleSided);
+        infoPanel.classList.remove('info-hidden');
+      } else {
+        if (!infoPanel.contains(e.target) && !closePanelBtn.contains(e.target)) {
+          infoPanel.classList.add('info-hidden');
+        }
+      }
+    }
+    function animate() {
+      requestAnimationFrame(animate);
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(warehouseObjects.children, true);
+      const cellHit = hits.find(h => h.object.userData.type === 'cell');
+
+      document.body.style.cursor = cellHit ? 'pointer' : 'default';
+      if (cellHit) {
+        if (INTERSECTED != cellHit.object) {
+          if (INTERSECTED) INTERSECTED.material.visible = false;
+          INTERSECTED = cellHit.object;
+          INTERSECTED.material.visible = true;
+        }
+      } else {
+        if (INTERSECTED) INTERSECTED.material.visible = false;
+        INTERSECTED = null;
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // ===== 8) Điều chỉnh nhanh =====
+    async function adjustBin(binId, sign) {
+      const qty = Math.max(1, Number(document.getElementById('adjQty').value || 0));
+      const msgEl = document.getElementById('adjMsg');
+      const bookNowEl = document.getElementById('bookNow');
+
+      msgEl.textContent = 'Đang cập nhật...';
+      try {
+        const res = await getJSON(`?action=adjust_bin&bin_id=${encodeURIComponent(binId)}&delta=${sign*qty}`);
+        if (bookNowEl && typeof res.qty_book !== 'undefined') bookNowEl.textContent = res.qty_book;
+        msgEl.textContent = `OK – qty_book mới: ${res.qty_book}`;
+        await refreshHeatmap(); // tô lại heatmap
+      } catch (e) {
+        msgEl.textContent = 'Lỗi: ' + e.message;
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
